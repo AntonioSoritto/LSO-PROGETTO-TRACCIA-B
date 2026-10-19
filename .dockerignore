@@ -1,0 +1,8 @@
+.git
+build
+bin
+*.o
+*.d
+.DS_Store
+*.swp
+*.tmp

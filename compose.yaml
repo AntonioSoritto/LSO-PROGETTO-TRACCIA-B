@@ -1,0 +1,24 @@
+services:
+  # Container server: espone la porta TCP del gioco verso la macchina host.
+  server:
+    build: .
+    command: ["./bin/server", "4242", "300", "5"]
+    ports:
+      - "4242:4242"
+    # Healthcheck semplice: verifica che la porta locale del server accetti connessioni.
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/4242'"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  # Container client: usa il nome DNS "server" della rete Compose, non 127.0.0.1.
+  client:
+    build: .
+    command: ["./bin/client", "server", "4242"]
+    depends_on:
+      server:
+        condition: service_healthy
+    # Necessari per rendere il terminale interattivo con la UI del client.
+    stdin_open: true
+    tty: true
