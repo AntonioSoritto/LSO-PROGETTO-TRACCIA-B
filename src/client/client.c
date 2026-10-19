@@ -214,7 +214,6 @@ static int process_socket(int fd, client_ctx_t *ctx, char *buf, size_t *len) {
 }
 
 static int execute_command(int fd, client_ctx_t *ctx, char *line) {
-    // Converte i comandi del client nei messaggi C2S del protocollo.
     char copy[PROTO_MAX_LINE];
     char *tok[PROTO_MAX_TOKENS];
     int ntok;
@@ -239,18 +238,9 @@ static int execute_command(int fd, client_ctx_t *ctx, char *line) {
         return send_command(fd, "C2S_MOVE %s", proto_direction_name(dir));
     }
     if (ntok == 1 && proto_parse_direction(tok[0], &dir) == 0) {
-        // Comando rapido: premere solo w/a/s/d equivale a move.
         return send_command(fd, "C2S_MOVE %s", proto_direction_name(dir));
     }
-    if ((strcmp(tok[0], "users") == 0 || strcmp(tok[0], "list") == 0) && ntok == 1) {
-        ui_add_event(&ctx->ui, "Richiesta lista utenti");
-        return send_command(fd, "C2S_LIST_USERS");
-    }
-    if ((strcmp(tok[0], "help") == 0 || strcmp(tok[0], "h") == 0) && ntok == 1) {
-        ui_add_event(&ctx->ui, "Guida rapida visibile nel pannello comandi");
-        return 0;
-    }
-    if ((strcmp(tok[0], "quit") == 0 || strcmp(tok[0], "q") == 0) && ntok == 1) {
+    if (strcmp(tok[0], "quit") == 0 && ntok == 1) {
         ui_add_event(&ctx->ui, "Uscita richiesta");
         if (send_command(fd, "C2S_QUIT") != 0) {
             return -1;
@@ -271,14 +261,17 @@ static int handle_input_byte(int fd, client_ctx_t *ctx, unsigned char ch) {
         send_command(fd, "C2S_QUIT");
         return 1;
     }
+
+    // Movimento immediato con WASD a prompt vuoto
     if (ctx->input_len == 0 && (ch == 'w' || ch == 'a' || ch == 's' || ch == 'd')) {
-        // A prompt vuoto il movimento e immediato, senza attendere Invio.
         command[0] = (char)ch;
         command[1] = '\0';
         if (proto_parse_direction(command, &dir) == 0) {
+            // IL RETURN È FONDAMENTALE: invia il comando ed esce SENZA aggiungere la lettera a ctx->input
             return send_command(fd, "C2S_MOVE %s", proto_direction_name(dir));
         }
     }
+
     if (ch == '\r' || ch == '\n') {
         // Invio conferma il comando accumulato in ctx->input.
         snprintf(command, sizeof(command), "%s", ctx->input);
@@ -286,6 +279,7 @@ static int handle_input_byte(int fd, client_ctx_t *ctx, unsigned char ch) {
         ctx->input_len = 0;
         return execute_command(fd, ctx, command);
     }
+
     if (ch == 127 || ch == 8) {
         // Gestione Backspace per terminali che inviano DEL (127) o BS (8).
         if (ctx->input_len > 0) {
@@ -293,11 +287,13 @@ static int handle_input_byte(int fd, client_ctx_t *ctx, unsigned char ch) {
         }
         return 0;
     }
+
     if (isprint(ch) && ctx->input_len + 1 < sizeof(ctx->input)) {
         // I caratteri stampabili vengono aggiunti al prompt locale.
         ctx->input[ctx->input_len++] = (char)ch;
         ctx->input[ctx->input_len] = '\0';
     }
+
     return 0;
 }
 

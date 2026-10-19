@@ -54,7 +54,6 @@ static void get_player_color_code(const char *symbol, char *out_color, size_t ou
         return;
     }
 
-    /* Lista di 30 colori vivaci ed estesi scelti dalla palette a 256 colori ANSI per evitare toni troppo scuri o neri */
     static const int ansi_256_palette[] = {
         10, 11, 12, 13, 14, 9, 202, 208, 214, 220, 226, 190, 154, 118, 82, 46,
         51, 45, 39, 27, 129, 165, 201, 207, 198, 162, 126, 172, 178, 184
@@ -130,7 +129,7 @@ static const char *get_player_at(int x, int y, const player_pos_t players[], int
     return NULL;
 }
 
-/* Rendering Mappa Locale con colore dinamico a 256 toni */
+/* Rendering Mappa Locale */
 static void print_local_map_row(const char *raw_row, const char *my_symbol)
 {
     int cells_printed = 0;
@@ -184,12 +183,13 @@ static void print_local_map_row(const char *raw_row, const char *my_symbol)
     }
 }
 
-/* Rendering Mappa Globale con colori dinamici a 256 toni per ogni giocatore */
+/* Rendering Mappa Globale */
 static void print_global_map_row(const char *raw_row, int row_idx, const player_pos_t players[], int num_players)
 {
     if (raw_row == NULL || raw_row[0] == '\0')
     {
-        putchar('\n');
+        /* Stampa uno spazio vuoto per mantenere allineata la colonna */
+        printf("%-60s", "");
         return;
     }
 
@@ -227,7 +227,6 @@ static void print_global_map_row(const char *raw_row, int row_idx, const player_
         col_idx++;
         cell = strtok_r(NULL, ",", &saveptr);
     }
-    putchar('\n');
 }
 
 static int parse_map_rows(const char *encoded, char rows[MAX_MAP_ROWS][MAX_ROW_LEN])
@@ -336,7 +335,7 @@ void ui_render(const ui_state_t *ui, const char *input)
     fputs("\033[2J\033[3J\033[H", stdout);
 
     print_divider();
-    puts("                                     CONQUISTA DEL TERRITORIO - CLIENT TCP                                     ");
+    puts("                                    CONQUISTA DEL TERRITORIO - CLIENT TCP                                    ");
     print_divider();
 
     if (ui->authenticated)
@@ -373,7 +372,8 @@ void ui_render(const ui_state_t *ui, const char *input)
         print_thin_divider();
     }
 
-    printf(" MAPPA LOCALE (11x11)              │ MAPPA GLOBALE (30x15)\n");
+    /* Intestazione della griglia con terza colonna per Giocatori Attivi */
+    printf(" MAPPA LOCALE (11x11)      │ MAPPA GLOBALE (30x15)                   │ GIOCATORI ATTIVI\n");
     print_thin_divider();
 
     char local_rows[MAX_MAP_ROWS][MAX_ROW_LEN] = {{0}};
@@ -386,6 +386,10 @@ void ui_render(const ui_state_t *ui, const char *input)
     int num_players = parse_player_positions(ui->positions, active_players, MAX_PLAYERS);
 
     int max_rows = num_local > num_global ? num_local : num_global;
+    if (max_rows < num_players) {
+        max_rows = num_players;
+    }
+
     if (max_rows == 0)
     {
         puts("  In attesa di dati delle mappe...");
@@ -398,17 +402,22 @@ void ui_render(const ui_state_t *ui, const char *input)
             print_local_map_row(r < num_local ? local_rows[r] : NULL, ui->player_symbol);
             printf(" │ ");
             print_global_map_row(r < num_global ? global_rows[r] : NULL, r, active_players, num_players);
+            printf(" │ ");
+
+            /* Stampa dei giocatori attivi sulla colonna destra riga per riga */
+            if (r < num_players)
+            {
+                char col[32];
+                get_player_color_code(active_players[r].symbol, col, sizeof(col));
+                printf("%s%-4s\033[0m (%2d,%2d)", col, active_players[r].symbol, active_players[r].x, active_players[r].y);
+            }
+            putchar('\n');
         }
     }
 
-    if (ui->authenticated && ui->global_valid && ui->positions[0] != '\0' && strcmp(ui->positions, "-") != 0)
-    {
-        print_thin_divider();
-        printf("Giocatori attivi: %s\n", ui->positions);
-    }
-
     print_divider();
-    puts("Comandi: w/a/s/d (movimento), users, quit");
+    /* Nota comandi aggiornata senza il riferimento a 'users' */
+    puts("Comandi: w/a/s/d (movimento), quit");
     printf("> %s", input != NULL ? input : "");
     fflush(stdout);
 }

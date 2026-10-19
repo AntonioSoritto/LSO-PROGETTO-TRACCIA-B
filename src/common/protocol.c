@@ -26,42 +26,41 @@ int proto_valid_name(const char *s, size_t max_len) {
     return 1;
 }
 
-// Converte testo o tasto rapido in una direzione del gioco.
+// Converte il tasto locale (w/a/s/d) nella direzione interna del gioco
+// Converte sia il tasto locale (w/a/s/d) sia i nomi canonici (UP/DOWN/LEFT/RIGHT)
 int proto_parse_direction(const char *s, direction_t *dir) {
-    // Accetta le forme usate dal protocollo e i tasti rapidi del client.
     if (s == NULL || dir == NULL) {
         return -1;
     }
-    if (strcmp(s, "UP") == 0 || strcmp(s, "up") == 0 || strcmp(s, "w") == 0) {
+    if (strcmp(s, "w") == 0 || strcmp(s, "UP") == 0) {
         *dir = DIR_UP;
         return 0;
     }
-    if (strcmp(s, "DOWN") == 0 || strcmp(s, "down") == 0 || strcmp(s, "s") == 0) {
+    if (strcmp(s, "s") == 0 || strcmp(s, "DOWN") == 0) {
         *dir = DIR_DOWN;
         return 0;
     }
-    if (strcmp(s, "LEFT") == 0 || strcmp(s, "left") == 0 || strcmp(s, "a") == 0) {
+    if (strcmp(s, "a") == 0 || strcmp(s, "LEFT") == 0) {
         *dir = DIR_LEFT;
         return 0;
     }
-    if (strcmp(s, "RIGHT") == 0 || strcmp(s, "right") == 0 || strcmp(s, "d") == 0) {
+    if (strcmp(s, "d") == 0 || strcmp(s, "RIGHT") == 0) {
         *dir = DIR_RIGHT;
         return 0;
     }
     return -1;
 }
 
-// Restituisce il nome canonico usato nel protocollo per una direzione.
+// Restituisce la stringa di rete da inviare al server (NON MODIFICARE QUESTE STRINGHE)
 const char *proto_direction_name(direction_t dir) {
     switch (dir) {
-        case DIR_UP: return "UP";
-        case DIR_DOWN: return "DOWN";
-        case DIR_LEFT: return "LEFT";
+        case DIR_UP:    return "UP";
+        case DIR_DOWN:  return "DOWN";
+        case DIR_LEFT:  return "LEFT";
         case DIR_RIGHT: return "RIGHT";
-        default: return "UNKNOWN";
+        default:        return "UNKNOWN";
     }
 }
-
 // Divide una riga in token separati da spazi, modificando il buffer originale.
 int proto_split(char *line, char **tokens, int max_tokens) {
     int count = 0;
