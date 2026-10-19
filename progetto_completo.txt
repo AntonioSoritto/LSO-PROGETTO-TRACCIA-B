@@ -1,0 +1,2982 @@
+=== FILE: src/client/client.c ===
+#include "client/client.h"
+
+#include "client/ui.h"
+#include "common/net.h"
+#include "common/protocol.h"
+#include "common/utils.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <termios.h>
+#include <unistd.h>
+
+/*
+ * Contesto runtime del client.
+ *
+ * ui contiene lo stato gia interpretato da mostrare a schermo; input contiene
+ * la riga che l'utente sta digitando. interactive distingue terminale reale
+ * da pipe/file, perche nel primo caso si usano echo manuale e refresh ANSI.
+ */
+typedef struct {
+    ui_state_t ui;
+    char input[UI_INPUT_MAX];
+    size_t input_len;
+    int interactive;
+} client_ctx_t;
+
+static struct termios saved_termios;
+static int termios_saved = 0;
+
+static void restore_terminal(void) {
+    // Ripristina il terminale se il client lo aveva messo in modalita non canonica.
+    if (termios_saved) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+        termios_saved = 0;
+    }
+}
+
+static void enable_terminal_mode(void) {
+    struct termios raw;
+
+    // In modalita interattiva leggiamo un byte alla volta, cosi w/a/s/d sono immediati.
+    if (!isatty(STDIN_FILENO)) {
+        return;
+    }
+    if (tcgetattr(STDIN_FILENO, &saved_termios) != 0) {
+        return;
+    }
+    raw = saved_termios;
+    // ICANON disattivato: read restituisce subito i singoli tasti; ECHO disattivato: stampa la UI.
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+    // VMIN/VTIME a zero rendono read non bloccante a livello di disciplina terminale.
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+        termios_saved = 1;
+    }
+}
+
+static int send_command(int fd, const char *fmt, ...) {
+    // Tutti i comandi applicativi sono righe terminate da '\n'.
+    char payload[PROTO_MAX_LINE];
+    char line[PROTO_MAX_LINE];
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(payload, sizeof(payload), fmt, ap);
+    va_end(ap);
+    // Se il comando non entra nel buffer lo rifiutiamo: evita troncamenti silenziosi.
+    if (n < 0 || (size_t)n >= sizeof(payload)) {
+        return -1;
+    }
+    if (proto_make_line(line, sizeof(line), "%s", payload) < 0) {
+        return -1;
+    }
+    return net_send_line(fd, line);
+}
+
+static void trim_newline(char *s) {
+    size_t n = strlen(s);
+    // Rimuove CR/LF finali per gestire sia UNIX sia input con terminatori CRLF.
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+        s[--n] = '\0';
+    }
+}
+
+static int parse_two_numbers(char **tok, long *a, long *b) {
+    int ok_a;
+    int ok_b;
+
+    // Usato per dimensioni mappa: il range e volutamente ampio ma finito.
+    *a = utils_parse_long(tok[1], 1, 200, &ok_a);
+    *b = utils_parse_long(tok[2], 1, 200, &ok_b);
+    return ok_a && ok_b;
+}
+
+static void handle_server_line(client_ctx_t *ctx, const char *line) {
+    // Traduce una riga del protocollo nello stato grafico mantenuto dalla UI.
+    char copy[PROTO_MAX_LINE];
+    char *tok[PROTO_MAX_TOKENS];
+    int ntok;
+    long w;
+    long h;
+    long x;
+    long y;
+
+    snprintf(copy, sizeof(copy), "%s", line);
+    // proto_split modifica la stringa, quindi lavora su una copia della riga ricevuta.
+    ntok = proto_split(copy, tok, PROTO_MAX_TOKENS);
+    if (ntok == 0) {
+        return;
+    }
+
+    if (strcmp(tok[0], "S2C_LOCAL_MAP") == 0 && ntok == 4) {
+        // Formato: S2C_LOCAL_MAP <w> <h> <mappa_codificata>.
+        if (parse_two_numbers(tok, &w, &h)) {
+            ui_set_local_map(&ctx->ui, (int)w, (int)h, tok[3]);
+            ui_add_event(&ctx->ui, "Mappa locale aggiornata");
+        }
+    } else if (strcmp(tok[0], "S2C_GLOBAL_UPDATE") == 0 && ntok == 5) {
+        // Formato: S2C_GLOBAL_UPDATE <w> <h> <mappa_globale> <posizioni>.
+        if (parse_two_numbers(tok, &w, &h)) {
+            ui_set_global_map(&ctx->ui, (int)w, (int)h, tok[3], tok[4]);
+            ui_add_event(&ctx->ui, "Aggiornamento globale ricevuto");
+        }
+    } else if (strcmp(tok[0], "S2C_USERS") == 0 && ntok == 2) {
+        ui_set_positions(&ctx->ui, tok[1]);
+        ui_add_event(&ctx->ui, "Utenti collegati: %s", tok[1]);
+    } else if (strcmp(tok[0], "S2C_GAME_OVER") == 0 && ntok == 4) {
+        ui_set_game_over(&ctx->ui, tok[1], tok[2], tok[3]);
+        ui_add_event(&ctx->ui, "Partita terminata");
+    } else if (strcmp(tok[0], "S2C_OK") == 0 && ntok >= 2) {
+        if (strcmp(tok[1], "CONNECTED") == 0) {
+            ui_set_connected(&ctx->ui, 1);
+            ui_add_event(&ctx->ui, "Connessione stabilita");
+        } else if (strcmp(tok[1], "REGISTERED") == 0) {
+            ui_add_event(&ctx->ui, "Registrazione completata");
+        } else if (strcmp(tok[1], "LOGGED_IN") == 0 && ntok == 6) {
+            int ok_x;
+            int ok_y;
+            // Il server ritorna nickname, simbolo giocatore e coordinate iniziali.
+            x = utils_parse_long(tok[4], 0, 10000, &ok_x);
+            y = utils_parse_long(tok[5], 0, 10000, &ok_y);
+            ui_set_user(&ctx->ui, tok[2], tok[3]);
+            if (ok_x && ok_y) {
+                ui_set_position(&ctx->ui, (int)x, (int)y);
+            }
+            ui_add_event(&ctx->ui, "Login effettuato");
+        } else if (strcmp(tok[1], "MOVED") == 0 && ntok == 4) {
+            int ok_x;
+            int ok_y;
+            x = utils_parse_long(tok[2], 0, 10000, &ok_x);
+            y = utils_parse_long(tok[3], 0, 10000, &ok_y);
+            if (ok_x && ok_y) {
+                ui_set_position(&ctx->ui, (int)x, (int)y);
+                ui_add_event(&ctx->ui, "Movimento eseguito: posizione (%ld,%ld)", x, y);
+            }
+        } else if (strcmp(tok[1], "BYE") == 0) {
+            ui_add_event(&ctx->ui, "Disconnessione confermata dal server");
+        } else {
+            ui_add_event(&ctx->ui, "OK dal server");
+        }
+    } else if (strcmp(tok[0], "S2C_ERR") == 0 && ntok >= 2) {
+        ui_add_event(&ctx->ui, "Errore server: %s", tok[1]);
+    } else {
+        ui_add_event(&ctx->ui, "Messaggio server non riconosciuto");
+    }
+}
+
+static int process_socket(int fd, client_ctx_t *ctx, char *buf, size_t *len) {
+    // TCP e uno stream: accumuliamo byte finche non troviamo righe complete.
+    char tmp[512];
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+
+    if (n < 0 && errno == EINTR) {
+        return 0;
+    }
+    if (n <= 0) {
+        ui_set_connected(&ctx->ui, 0);
+        ui_add_event(&ctx->ui, "Connessione chiusa dal server");
+        return -1;
+    }
+    if (*len + (size_t)n >= PROTO_MAX_LINE) {
+        ui_add_event(&ctx->ui, "Messaggio server troppo lungo");
+        return -1;
+    }
+    memcpy(buf + *len, tmp, (size_t)n);
+    *len += (size_t)n;
+    buf[*len] = '\0';
+
+    while (1) {
+        char *nl = memchr(buf, '\n', *len);
+        char line[PROTO_MAX_LINE];
+        size_t line_len;
+        if (nl == NULL) {
+            break;
+        }
+        // Estrae una sola riga completa e lascia nel buffer eventuali byte successivi.
+        line_len = (size_t)(nl - buf);
+        memcpy(line, buf, line_len);
+        line[line_len] = '\0';
+        memmove(buf, nl + 1, *len - line_len - 1);
+        *len -= line_len + 1;
+        buf[*len] = '\0';
+        handle_server_line(ctx, line);
+    }
+    return 0;
+}
+
+static int execute_command(int fd, client_ctx_t *ctx, char *line) {
+    char copy[PROTO_MAX_LINE];
+    char *tok[PROTO_MAX_TOKENS];
+    int ntok;
+    direction_t dir;
+
+    trim_newline(line);
+    snprintf(copy, sizeof(copy), "%s", line);
+    ntok = proto_split(copy, tok, PROTO_MAX_TOKENS);
+    if (ntok == 0) {
+        return 0;
+    }
+
+    if (strcmp(tok[0], "register") == 0 && ntok == 3) {
+        ui_add_event(&ctx->ui, "Invio registrazione per %s", tok[1]);
+        return send_command(fd, "C2S_REGISTER %s %s", tok[1], tok[2]);
+    }
+    if (strcmp(tok[0], "login") == 0 && ntok == 3) {
+        ui_add_event(&ctx->ui, "Invio login per %s", tok[1]);
+        return send_command(fd, "C2S_LOGIN %s %s", tok[1], tok[2]);
+    }
+    if (strcmp(tok[0], "move") == 0 && ntok == 2 && proto_parse_direction(tok[1], &dir) == 0) {
+        return send_command(fd, "C2S_MOVE %s", proto_direction_name(dir));
+    }
+    if (ntok == 1 && proto_parse_direction(tok[0], &dir) == 0) {
+        return send_command(fd, "C2S_MOVE %s", proto_direction_name(dir));
+    }
+    if (strcmp(tok[0], "quit") == 0 && ntok == 1) {
+        ui_add_event(&ctx->ui, "Uscita richiesta");
+        if (send_command(fd, "C2S_QUIT") != 0) {
+            return -1;
+        }
+        return 1;
+    }
+
+    ui_add_event(&ctx->ui, "Comando non riconosciuto: %s", tok[0]);
+    return 0;
+}
+
+static int handle_input_byte(int fd, client_ctx_t *ctx, unsigned char ch) {
+    char command[UI_INPUT_MAX];
+    direction_t dir;
+
+    // Ctrl+D e EOF vengono trattati come uscita pulita.
+    if (ch == 4) {
+        send_command(fd, "C2S_QUIT");
+        return 1;
+    }
+
+    // Movimento immediato con WASD a prompt vuoto
+    if (ctx->input_len == 0 && (ch == 'w' || ch == 'a' || ch == 's' || ch == 'd')) {
+        command[0] = (char)ch;
+        command[1] = '\0';
+        if (proto_parse_direction(command, &dir) == 0) {
+            // IL RETURN È FONDAMENTALE: invia il comando ed esce SENZA aggiungere la lettera a ctx->input
+            return send_command(fd, "C2S_MOVE %s", proto_direction_name(dir));
+        }
+    }
+
+    if (ch == '\r' || ch == '\n') {
+        // Invio conferma il comando accumulato in ctx->input.
+        snprintf(command, sizeof(command), "%s", ctx->input);
+        ctx->input[0] = '\0';
+        ctx->input_len = 0;
+        return execute_command(fd, ctx, command);
+    }
+
+    if (ch == 127 || ch == 8) {
+        // Gestione Backspace per terminali che inviano DEL (127) o BS (8).
+        if (ctx->input_len > 0) {
+            ctx->input[--ctx->input_len] = '\0';
+        }
+        return 0;
+    }
+
+    if (isprint(ch) && ctx->input_len + 1 < sizeof(ctx->input)) {
+        // I caratteri stampabili vengono aggiunti al prompt locale.
+        ctx->input[ctx->input_len++] = (char)ch;
+        ctx->input[ctx->input_len] = '\0';
+    }
+
+    return 0;
+}
+
+static int process_stdin(int fd, client_ctx_t *ctx, int *command_done) {
+    // Gestisce sia terminale interattivo sia input da pipe/file.
+    unsigned char tmp[128];
+    ssize_t n;
+    ssize_t i;
+    int rc = 0;
+
+    *command_done = 0;
+    n = read(STDIN_FILENO, tmp, sizeof(tmp));
+    if (n == 0) {
+        // EOF su stdin: chiusura pulita, utile per test con input rediretto.
+        send_command(fd, "C2S_QUIT");
+        return 1;
+    }
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return 0;
+        }
+        return -1;
+    }
+    for (i = 0; i < n; ++i) {
+        // In modalita raw possono arrivare piu byte insieme: si processano uno per volta.
+        rc = handle_input_byte(fd, ctx, tmp[i]);
+        if (tmp[i] == '\r' || tmp[i] == '\n') {
+            *command_done = 1;
+        }
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    return 0;
+}
+
+int client_run(const char *host, const char *port) {
+    int fd = net_connect_tcp(host, port);
+    char sock_buf[PROTO_MAX_LINE];
+    size_t sock_len = 0;
+    int running = 1;
+    int exit_status = 0;
+    client_ctx_t ctx;
+
+    if (fd < 0) {
+        return -1;
+    }
+
+    // Evita terminazione del processo se il server chiude il socket durante una send.
+    signal(SIGPIPE, SIG_IGN);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    ui_init(&ctx.ui, host, port);
+    ui_set_connected(&ctx.ui, 1);
+    ui_add_event(&ctx.ui, "Connesso a %s:%s", host, port);
+
+    enable_terminal_mode();
+    ui_render(&ctx.ui, ctx.input);
+
+    while (running) {
+        fd_set rfds;
+        int maxfd = fd > STDIN_FILENO ? fd : STDIN_FILENO;
+        int rc;
+        int should_render = 0;
+
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        // select permette di ricevere update dal server mentre l'utente digita.
+        rc = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            exit_status = -1;
+            break;
+        }
+        if (FD_ISSET(fd, &rfds)) {
+            // Priorita agli eventi di rete: possono aggiornare mappe, errori o game over.
+            if (process_socket(fd, &ctx, sock_buf, &sock_len) != 0) {
+                running = 0;
+            }
+            should_render = 1;
+        }
+        if (running && FD_ISSET(STDIN_FILENO, &rfds)) {
+            int command_done = 0;
+            rc = process_stdin(fd, &ctx, &command_done);
+            if (rc < 0) {
+                exit_status = -1;
+                running = 0;
+            } else if (rc > 0) {
+                running = 0;
+            }
+            // Aggiorna sempre lo schermo ad ogni carattere digitato per dare immediato feedback visivo
+            should_render = 1;
+        }
+
+        if (should_render) {
+            ui_render(&ctx.ui, ctx.input);
+        }
+    }
+
+    ui_render(&ctx.ui, ctx.input);
+    restore_terminal();
+    ui_finish();
+    close(fd);
+    return exit_status;
+}
+
+=== FILE: src/client/client.h ===
+#ifndef CLIENT_H
+#define CLIENT_H
+
+/*
+ * Avvia il client interattivo.
+ *
+ * host e port identificano il server TCP. La funzione ritorna 0 in caso di
+ * chiusura normale, -1 per errori di rete o di I/O.
+ */
+int client_run(const char *host, const char *port);
+
+#endif
+
+
+=== FILE: src/client/main.c ===
+#include "client/client.h"
+#include "common/net.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+// Punto di ingresso del client: richiede host/porta e avvia client_run().
+int main(int argc, char **argv) {
+    // Il client ha bisogno sia dell'indirizzo sia della porta del server.
+    if (argc != 3) {
+        fprintf(stderr, "Uso: %s <host> <porta>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    // Gli errori di rete vengono esposti dal modulo common/net.
+    if (client_run(argv[1], argv[2]) != 0) {
+        fprintf(stderr, "Client terminato con errore: %s\n", net_last_error());
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+
+=== FILE: src/client/ui.c ===
+#include "client/ui.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define MAX_MAP_ROWS 30
+#define MAX_ROW_LEN 256
+#define MAX_PLAYERS 64
+
+typedef struct {
+    char symbol[8];
+    int x;
+    int y;
+} player_pos_t;
+
+static void safe_copy(char *dst, size_t dst_size, const char *src)
+{
+    if (dst_size == 0) return;
+    if (src == NULL) src = "";
+    snprintf(dst, dst_size, "%s", src);
+}
+
+static void print_divider(void)
+{
+    puts("===================================================================================================================================");
+}
+
+static void print_thin_divider(void)
+{
+    puts("-----------------------------------------------------------------------------------------------------------------------------------");
+}
+
+/* Hash per distribuire in modo pseudo-casuale e uniforme i colori ANSI a 256 tonalità */
+static unsigned int hash_text(const char *s)
+{
+    unsigned int h = 5381;
+    while (s != NULL && *s != '\0')
+    {
+        h = ((h << 5) + h) ^ (unsigned char)*s;
+        ++s;
+    }
+    return h;
+}
+
+/* Genera dinamicamente un codice colore ANSI a 256 colori visibile e brillante */
+static void get_player_color_code(const char *symbol, char *out_color, size_t out_size)
+{
+    if (symbol == NULL || symbol[0] == '\0')
+    {
+        snprintf(out_color, out_size, "\033[1;37m"); /* Bianco di default */
+        return;
+    }
+
+    static const int ansi_256_palette[] = {
+        10, 11, 12, 13, 14, 9, 202, 208, 214, 220, 226, 190, 154, 118, 82, 46,
+        51, 45, 39, 27, 129, 165, 201, 207, 198, 162, 126, 172, 178, 184
+    };
+
+    unsigned int idx = hash_text(symbol) % (sizeof(ansi_256_palette) / sizeof(ansi_256_palette[0]));
+    snprintf(out_color, out_size, "\033[38;5;%dm", ansi_256_palette[idx]);
+}
+
+/* Parsing posizioni giocatori inviate dal server */
+static int parse_player_positions(const char *positions_str, player_pos_t players[], int max_p)
+{
+    if (positions_str == NULL || positions_str[0] == '\0' || strcmp(positions_str, "-") == 0)
+    {
+        return 0;
+    }
+
+    char buf[2048];
+    strncpy(buf, positions_str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    int count = 0;
+    char *saveptr_token;
+    char *token = strtok_r(buf, " ;,", &saveptr_token);
+
+    while (token != NULL && count < max_p)
+    {
+        char token_copy[128];
+        strncpy(token_copy, token, sizeof(token_copy) - 1);
+        token_copy[sizeof(token_copy) - 1] = '\0';
+
+        char *parts[5];
+        int nparts = 0;
+        char *saveptr_sub;
+        char *sub = strtok_r(token_copy, ":", &saveptr_sub);
+
+        while (sub != NULL && nparts < 5)
+        {
+            parts[nparts++] = sub;
+            sub = strtok_r(NULL, ":", &saveptr_sub);
+        }
+
+        if (nparts >= 4)
+        {
+            strncpy(players[count].symbol, parts[1], sizeof(players[count].symbol) - 1);
+            players[count].x = atoi(parts[2]);
+            players[count].y = atoi(parts[3]);
+            count++;
+        }
+        else if (nparts == 3)
+        {
+            strncpy(players[count].symbol, parts[0], sizeof(players[count].symbol) - 1);
+            players[count].x = atoi(parts[1]);
+            players[count].y = atoi(parts[2]);
+            count++;
+        }
+
+        token = strtok_r(NULL, " ;,", &saveptr_token);
+    }
+
+    return count;
+}
+
+static const char *get_player_at(int x, int y, const player_pos_t players[], int num_players)
+{
+    for (int i = 0; i < num_players; ++i)
+    {
+        if (players[i].x == x && players[i].y == y)
+        {
+            return players[i].symbol;
+        }
+    }
+    return NULL;
+}
+
+/* Rendering Mappa Locale */
+static void print_local_map_row(const char *raw_row, const char *my_symbol)
+{
+    int cells_printed = 0;
+    char col[32];
+
+    if (raw_row != NULL && raw_row[0] != '\0')
+    {
+        char row_copy[512];
+        strncpy(row_copy, raw_row, sizeof(row_copy) - 1);
+        row_copy[sizeof(row_copy) - 1] = '\0';
+
+        char *saveptr;
+        char *cell = strtok_r(row_copy, ",", &saveptr);
+        while (cell != NULL && cells_printed < 11)
+        {
+            if (strcmp(cell, "@") == 0)
+            {
+                get_player_color_code(my_symbol, col, sizeof(col));
+                printf("%s@  \033[0m", col);
+            }
+            else if (strcmp(cell, "#") == 0)
+            {
+                printf("\033[1;37m█  \033[0m");       /* Ostacolo */
+            }
+            else if (strcmp(cell, "~") == 0)
+            {
+                printf("\033[0;34m~  \033[0m");       /* Fuori confini */
+            }
+            else if (strcmp(cell, ".") == 0)
+            {
+                printf("\033[0;30m.  \033[0m");       /* Cella vuota */
+            }
+            else if (strncmp(cell, "P", 1) == 0)
+            {
+                get_player_color_code(cell, col, sizeof(col));
+                printf("%s%-2s \033[0m", col, cell);
+            }
+            else
+            {
+                printf("%-2s ", cell);
+            }
+            cells_printed++;
+            cell = strtok_r(NULL, ",", &saveptr);
+        }
+    }
+
+    while (cells_printed < 11)
+    {
+        printf("   ");
+        cells_printed++;
+    }
+}
+
+/* Rendering Mappa Globale */
+static void print_global_map_row(const char *raw_row, int row_idx, const player_pos_t players[], int num_players)
+{
+    if (raw_row == NULL || raw_row[0] == '\0')
+    {
+        /* Stampa uno spazio vuoto per mantenere allineata la colonna */
+        printf("%-60s", "");
+        return;
+    }
+
+    char row_copy[512];
+    strncpy(row_copy, raw_row, sizeof(row_copy) - 1);
+    row_copy[sizeof(row_copy) - 1] = '\0';
+
+    int col_idx = 0;
+    char col[32];
+    char *saveptr;
+    char *cell = strtok_r(row_copy, ",", &saveptr);
+    while (cell != NULL)
+    {
+        const char *p_at = get_player_at(col_idx, row_idx, players, num_players);
+
+        if (p_at != NULL)
+        {
+            get_player_color_code(p_at, col, sizeof(col));
+            printf("%s@  \033[0m", col);
+        }
+        else if (strcmp(cell, ".") == 0)
+        {
+            printf("\033[0;30m.  \033[0m");          /* Cella vuota */
+        }
+        else if (strncmp(cell, "P", 1) == 0)
+        {
+            get_player_color_code(cell, col, sizeof(col));
+            printf("%s%-2s \033[0m", col, cell);
+        }
+        else
+        {
+            printf("%-2s ", cell);
+        }
+
+        col_idx++;
+        cell = strtok_r(NULL, ",", &saveptr);
+    }
+}
+
+static int parse_map_rows(const char *encoded, char rows[MAX_MAP_ROWS][MAX_ROW_LEN])
+{
+    if (encoded == NULL || encoded[0] == '\0') return 0;
+
+    char copy[16384];
+    strncpy(copy, encoded, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = '\0';
+
+    int count = 0;
+    char *saveptr;
+    char *line = strtok_r(copy, "/", &saveptr);
+    while (line != NULL && count < MAX_MAP_ROWS)
+    {
+        strncpy(rows[count], line, MAX_ROW_LEN - 1);
+        rows[count][MAX_ROW_LEN - 1] = '\0';
+        count++;
+        line = strtok_r(NULL, "/", &saveptr);
+    }
+    return count;
+}
+
+void ui_init(ui_state_t *ui, const char *host, const char *port)
+{
+    memset(ui, 0, sizeof(*ui));
+    snprintf(ui->server, sizeof(ui->server), "%s:%s", host, port);
+    safe_copy(ui->nickname, sizeof(ui->nickname), "-");
+    safe_copy(ui->positions, sizeof(ui->positions), "-");
+    safe_copy(ui->status, sizeof(ui->status), "connessione in corso");
+    safe_copy(ui->player_symbol, sizeof(ui->player_symbol), "P0");
+}
+
+void ui_set_connected(ui_state_t *ui, int connected)
+{
+    ui->connected = connected;
+    safe_copy(ui->status, sizeof(ui->status), connected ? "connesso" : "disconnesso");
+}
+
+void ui_set_user(ui_state_t *ui, const char *nickname, const char *player_symbol)
+{
+    ui->authenticated = 1;
+    safe_copy(ui->nickname, sizeof(ui->nickname), nickname);
+    safe_copy(ui->player_symbol, sizeof(ui->player_symbol), player_symbol);
+    safe_copy(ui->status, sizeof(ui->status), "autenticato");
+}
+
+void ui_set_position(ui_state_t *ui, int x, int y)
+{
+    ui->position_known = 1;
+    ui->x = x;
+    ui->y = y;
+}
+
+void ui_set_local_map(ui_state_t *ui, int w, int h, const char *encoded)
+{
+    ui->local_valid = 1;
+    ui->local_w = w;
+    ui->local_h = h;
+    safe_copy(ui->local_map, sizeof(ui->local_map), encoded);
+}
+
+void ui_set_global_map(ui_state_t *ui, int w, int h, const char *encoded, const char *positions)
+{
+    ui->global_valid = 1;
+    ui->global_w = w;
+    ui->global_h = h;
+    safe_copy(ui->global_map, sizeof(ui->global_map), encoded);
+    safe_copy(ui->positions, sizeof(ui->positions), positions);
+}
+
+void ui_set_positions(ui_state_t *ui, const char *positions)
+{
+    safe_copy(ui->positions, sizeof(ui->positions), positions);
+}
+
+void ui_set_game_over(ui_state_t *ui, const char *winner, const char *score, const char *scores)
+{
+    ui->game_over = 1;
+    snprintf(ui->game_result, sizeof(ui->game_result),
+             "Vincitore: %s (%s celle) | Punteggi: %s", winner, score, scores);
+    safe_copy(ui->status, sizeof(ui->status), "partita terminata");
+}
+
+void ui_add_event(ui_state_t *ui, const char *fmt, ...)
+{
+    va_list ap;
+    int idx = ui->event_next;
+
+    va_start(ap, fmt);
+    vsnprintf(ui->events[idx], sizeof(ui->events[idx]), fmt, ap);
+    va_end(ap);
+
+    ui->event_next = (ui->event_next + 1) % UI_EVENTS_MAX;
+    if (ui->event_count < UI_EVENTS_MAX)
+    {
+        ui->event_count++;
+    }
+}
+
+void ui_render(const ui_state_t *ui, const char *input)
+{
+    if (!ui) return;
+
+    /* Reset schermo e cursore in-place */
+    fputs("\033[2J\033[3J\033[H", stdout);
+
+    print_divider();
+    puts("                                    CONQUISTA DEL TERRITORIO - CLIENT TCP                                    ");
+    print_divider();
+
+    if (ui->authenticated)
+    {
+        char my_col[32];
+        get_player_color_code(ui->player_symbol, my_col, sizeof(my_col));
+        printf("Utente: %s%s\033[0m (%s%s\033[0m)", my_col, ui->nickname, my_col, ui->player_symbol);
+        if (ui->position_known)
+        {
+            printf(" | Posizione: (%d, %d)", ui->x, ui->y);
+        }
+        putchar('\n');
+    }
+    else
+    {
+        printf("Stato: \033[1;31mNON AUTENTICATO\033[0m (Usa 'register <nick> <pass>' o 'login <nick> <pass>')\n");
+    }
+
+    print_thin_divider();
+    if (ui->event_count > 0)
+    {
+        int last_idx = (ui->event_next + UI_EVENTS_MAX - 1) % UI_EVENTS_MAX;
+        printf("Ultimo evento: \033[1;33m%s\033[0m\n", ui->events[last_idx]);
+    }
+    else
+    {
+        printf("Ultimo evento: \033[1;33mIn attesa di connessione...\033[0m\n");
+    }
+    print_thin_divider();
+
+    if (ui->game_over)
+    {
+        printf("\033[1;31mFINE PARTITA:\033[0m %s\n", ui->game_result);
+        print_thin_divider();
+    }
+
+    /* Intestazione della griglia con terza colonna per Giocatori Attivi */
+    printf(" MAPPA LOCALE (11x11)      │ MAPPA GLOBALE (30x15)                   │ GIOCATORI ATTIVI\n");
+    print_thin_divider();
+
+    char local_rows[MAX_MAP_ROWS][MAX_ROW_LEN] = {{0}};
+    char global_rows[MAX_MAP_ROWS][MAX_ROW_LEN] = {{0}};
+
+    int num_local = (ui->authenticated && ui->local_valid) ? parse_map_rows(ui->local_map, local_rows) : 0;
+    int num_global = (ui->authenticated && ui->global_valid) ? parse_map_rows(ui->global_map, global_rows) : 0;
+
+    player_pos_t active_players[MAX_PLAYERS];
+    int num_players = parse_player_positions(ui->positions, active_players, MAX_PLAYERS);
+
+    int max_rows = num_local > num_global ? num_local : num_global;
+    if (max_rows < num_players) {
+        max_rows = num_players;
+    }
+
+    if (max_rows == 0)
+    {
+        puts("  In attesa di dati delle mappe...");
+    }
+    else
+    {
+        for (int r = 0; r < max_rows; ++r)
+        {
+            printf(" ");
+            print_local_map_row(r < num_local ? local_rows[r] : NULL, ui->player_symbol);
+            printf(" │ ");
+            print_global_map_row(r < num_global ? global_rows[r] : NULL, r, active_players, num_players);
+            printf(" │ ");
+
+            /* Stampa dei giocatori attivi sulla colonna destra riga per riga */
+            if (r < num_players)
+            {
+                char col[32];
+                get_player_color_code(active_players[r].symbol, col, sizeof(col));
+                printf("%s%-4s\033[0m (%2d,%2d)", col, active_players[r].symbol, active_players[r].x, active_players[r].y);
+            }
+            putchar('\n');
+        }
+    }
+
+    print_divider();
+    /* Nota comandi aggiornata senza il riferimento a 'users' */
+    puts("Comandi: w/a/s/d (movimento), quit");
+    printf("> %s", input != NULL ? input : "");
+    fflush(stdout);
+}
+
+void ui_finish(void)
+{
+    if (isatty(STDOUT_FILENO))
+    {
+        fputs("\033[0m\n", stdout);
+        fflush(stdout);
+    }
+}
+
+=== FILE: src/client/ui.h ===
+#ifndef UI_H
+#define UI_H
+
+#include "common/protocol.h"
+
+#include <stddef.h>
+
+#define UI_TEXT_MAX 256
+#define UI_EVENTS_MAX 6
+#define UI_INPUT_MAX 256
+#define UI_SYMBOL_MAX 32
+#define UI_MAP_MAX PROTO_MAX_LINE
+
+/*
+ * Stato completo della UI testuale.
+ *
+ * Il client non mantiene la logica autoritativa della partita: conserva solo
+ * l'ultima rappresentazione ricevuta dal server e informazioni locali utili
+ * al rendering, come eventi e contenuto del prompt.
+ */
+typedef struct {
+    /* Flag di alto livello mostrati nel pannello stato. */
+    int connected;
+    int authenticated;
+    int position_known;
+    int game_over;
+
+    /* Validita delle mappe: prima del login/aggiornamento i buffer sono vuoti. */
+    int local_valid;   
+    int global_valid;
+
+    /* Dimensioni dichiarate dal server insieme alle mappe codificate. */
+    int local_w;
+    int local_h;
+    int global_w;
+    int global_h;
+
+    /* Ultima posizione nota del giocatore autenticato. */
+    int x;
+    int y;
+
+    /* Stringhe gia pronte per il rendering del terminale. */
+    char server[UI_TEXT_MAX];
+    char nickname[NICK_MAX + 1];
+    char player_symbol[UI_SYMBOL_MAX];
+    char status[UI_TEXT_MAX];
+    char local_map[UI_MAP_MAX];
+    char global_map[UI_MAP_MAX];
+    char positions[PROTO_MAX_LINE];
+    char game_result[UI_TEXT_MAX];
+
+    /* Ring buffer degli ultimi eventi: event_next indica la prossima cella da sovrascrivere. */
+    char events[UI_EVENTS_MAX][UI_TEXT_MAX];
+    int event_count;
+    int event_next;
+} ui_state_t;
+
+/* Inizializzazione e funzioni setter: separano parsing di rete e rendering. */
+void ui_init(ui_state_t *ui, const char *host, const char *port);
+void ui_set_connected(ui_state_t *ui, int connected);
+void ui_set_user(ui_state_t *ui, const char *nickname, const char *player_symbol);
+void ui_set_position(ui_state_t *ui, int x, int y);
+void ui_set_local_map(ui_state_t *ui, int w, int h, const char *encoded);
+void ui_set_global_map(ui_state_t *ui, int w, int h, const char *encoded, const char *positions);
+void ui_set_positions(ui_state_t *ui, const char *positions);
+void ui_set_game_over(ui_state_t *ui, const char *winner, const char *score, const char *scores);
+void ui_add_event(ui_state_t *ui, const char *fmt, ...);
+
+/* Ridisegna tutta la schermata usando lo stato corrente e il testo nel prompt. */
+void ui_render(const ui_state_t *ui, const char *input);
+
+/* Ripristina lo stato ANSI del terminale prima dell'uscita. */
+void ui_finish(void);
+
+#endif
+
+
+=== FILE: src/common/net.c ===
+#define _POSIX_C_SOURCE 200112L
+
+#include "common/net.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+static char g_net_last_error[256] = "nessun errore di rete registrato";
+
+// Salva un messaggio diagnostico globale semplice: il progetto e single-thread.
+static void net_set_error(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(g_net_last_error, sizeof(g_net_last_error), fmt, ap);
+    va_end(ap);
+}
+
+// Invia tutti i byte del buffer, gestendo invii parziali e interruzioni.
+static int net_send_all(int fd, const char *buf, size_t len)
+{
+    size_t sent = 0;
+
+    while (sent < len)
+    {
+        ssize_t n = send(fd, buf + sent, len - sent, 0);
+        if (n < 0)
+        {
+            // EINTR significa che un segnale ha interrotto send: si puo riprovare.
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            net_set_error("send su fd=%d fallita: %s", fd, strerror(errno));
+            return -1;
+        }
+        if (n == 0)
+        {
+            net_set_error("send su fd=%d ha scritto 0 byte", fd);
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
+// Invia una riga gia formata sul socket.
+int net_send_line(int fd, const char *line)
+{
+    return net_send_all(fd, line, strlen(line));
+}
+
+const char *net_last_error(void)
+{
+    return g_net_last_error;
+}
+
+// Crea il socket TCP IPv4 del server, valida la porta e avvia listen().
+int net_create_server_socket(const char *port)
+{
+    struct sockaddr_in addr;
+    char *endptr;
+    long port_num;
+    int fd = -1;
+    int yes = 1;
+
+    // La porta arriva da argv come stringa: strtol permette di validarla completamente.
+    errno = 0;
+    port_num = strtol(port, &endptr, 10);
+    if (errno != 0 || endptr == port || *endptr != '\0' ||
+        port_num < 1 || port_num > 65535)
+    {
+        net_set_error("porta non valida: %s", port);
+        return -1;
+    }
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        net_set_error("socket server fallita: %s", strerror(errno));
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) != 0)
+    {
+        net_set_error("setsockopt(SO_REUSEADDR) fallita: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    // INADDR_ANY accetta connessioni su tutte le interfacce della macchina.
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port_num);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        net_set_error("bind sulla porta %s fallita: %s", port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 16) != 0)
+    {
+        net_set_error("listen sulla porta %s fallita: %s", port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Apre una connessione TCP verso host:port usando getaddrinfo().
+int net_connect_tcp(const char *host, const char *port)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *p;
+    int fd = -1;
+    int gai_rc;
+
+    memset(&hints, 0, sizeof(hints));
+    // AF_UNSPEC lascia a getaddrinfo la scelta fra IPv4 e IPv6.
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    gai_rc = getaddrinfo(host, port, &hints, &res);
+    if (gai_rc != 0)
+    {
+        net_set_error("risoluzione indirizzo %s:%s fallita: %s", host, port, gai_strerror(gai_rc));
+        return -1;
+    }
+
+    for (p = res; p != NULL; p = p->ai_next)
+    {
+        // Si prova ogni indirizzo risolto finche una connect va a buon fine.
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0)
+        {
+            net_set_error("socket client fallita per %s:%s: %s", host, port, strerror(errno));
+            continue;
+        }
+        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0)
+        {
+            break;
+        }
+        net_set_error("connect verso %s:%s fallita: %s", host, port, strerror(errno));
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+    if (fd < 0 && strcmp(g_net_last_error, "nessun errore di rete registrato") == 0)
+    {
+        net_set_error("nessun endpoint raggiungibile per %s:%s", host, port);
+    }
+    return fd;
+}
+
+
+=== FILE: src/common/net.h ===
+#ifndef NET_H
+#define NET_H
+
+#include <stddef.h>
+
+/*
+ * Interfaccia di rete comune.
+ *
+ * Il progetto usa TCP stream: non esiste un confine naturale fra messaggi,
+ * quindi i moduli applicativi inviano righe testuali complete e poi accumulano
+ * byte in ricezione finche non trovano '\n'.
+ */
+
+/* Crea, configura, associa e mette in ascolto un socket server TCP. */
+int net_create_server_socket(const char *port);
+
+/* Apre una connessione TCP verso host:port, supportando IPv4/IPv6 via getaddrinfo. */
+int net_connect_tcp(const char *host, const char *port);
+
+/* Invia l'intera riga gia formata; gestisce eventuali send parziali. */
+int net_send_line(int fd, const char *line);
+
+/* Ultimo errore di rete in forma leggibile, utile per main e diagnostica. */
+const char *net_last_error(void);
+
+#endif
+
+
+=== FILE: src/common/protocol.c ===
+#include "common/protocol.h"
+
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+// Valida nickname/password: non vuoti, lunghezza massima e caratteri ammessi.
+int proto_valid_name(const char *s, size_t max_len) {
+    size_t i;
+
+    // NULL e stringa vuota vengono rifiutati per evitare account anonimi.
+    if (s == NULL || s[0] == '\0') {
+        return 0;
+    }
+    for (i = 0; s[i] != '\0'; ++i) {
+        // i parte da 0: quando raggiunge max_len la stringa e troppo lunga.
+        if (i >= max_len) {
+            return 0;
+        }
+        // Si evitano spazi e simboli per mantenere semplice il protocollo a token.
+        if (!isalnum((unsigned char)s[i]) && s[i] != '_' && s[i] != '-') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Converte il tasto locale (w/a/s/d) nella direzione interna del gioco
+// Converte sia il tasto locale (w/a/s/d) sia i nomi canonici (UP/DOWN/LEFT/RIGHT)
+int proto_parse_direction(const char *s, direction_t *dir) {
+    if (s == NULL || dir == NULL) {
+        return -1;
+    }
+    if (strcmp(s, "w") == 0 || strcmp(s, "UP") == 0) {
+        *dir = DIR_UP;
+        return 0;
+    }
+    if (strcmp(s, "s") == 0 || strcmp(s, "DOWN") == 0) {
+        *dir = DIR_DOWN;
+        return 0;
+    }
+    if (strcmp(s, "a") == 0 || strcmp(s, "LEFT") == 0) {
+        *dir = DIR_LEFT;
+        return 0;
+    }
+    if (strcmp(s, "d") == 0 || strcmp(s, "RIGHT") == 0) {
+        *dir = DIR_RIGHT;
+        return 0;
+    }
+    return -1;
+}
+
+// Restituisce la stringa di rete da inviare al server (NON MODIFICARE QUESTE STRINGHE)
+const char *proto_direction_name(direction_t dir) {
+    switch (dir) {
+        case DIR_UP:    return "UP";
+        case DIR_DOWN:  return "DOWN";
+        case DIR_LEFT:  return "LEFT";
+        case DIR_RIGHT: return "RIGHT";
+        default:        return "UNKNOWN";
+    }
+}
+// Divide una riga in token separati da spazi, modificando il buffer originale.
+int proto_split(char *line, char **tokens, int max_tokens) {
+    int count = 0;
+    char *p = line;
+
+    while (*p != '\0' && count < max_tokens) {
+        // Salta tutti i separatori iniziali o ripetuti.
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        // Il token inizia qui: si salva il puntatore direttamente dentro line.
+        tokens[count++] = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+            ++p;
+        }
+        if (*p != '\0') {
+            // Sostituiamo il separatore con '\0', cosi ogni token diventa una stringa C.
+            *p++ = '\0';
+        }
+    }
+    return count;
+}
+
+// Costruisce una riga di protocollo e aggiunge sempre il newline finale.
+int proto_make_line(char *dst, size_t dst_size, const char *fmt, ...) {
+    va_list ap;
+    int n;
+
+    if (dst == NULL || dst_size == 0 || fmt == NULL) {
+        return -1;
+    }
+
+    va_start(ap, fmt);
+    n = vsnprintf(dst, dst_size, fmt, ap);
+    va_end(ap);
+
+    if (n < 0 || (size_t)n + 2 > dst_size) {
+        return -1;
+    }
+    // Il framing del protocollo dipende dal newline: senza '\n' il ricevitore resta in attesa.
+    dst[n] = '\n';
+    dst[n + 1] = '\0';
+    return n + 1;
+}
+
+
+=== FILE: src/common/protocol.h ===
+#ifndef PROTOCOL_H
+#define PROTOCOL_H
+
+#include <stddef.h>
+
+/*
+ * Modulo protocollo.
+ *
+ * Client e server comunicano con messaggi testuali terminati da '\n'.
+ * Ogni messaggio e composto da token separati da spazi:
+ *
+ *   C2S_LOGIN mario password
+ *   S2C_OK MOVED 10 4
+ *
+ * Questo header raccoglie dimensioni massime, tipi condivisi e funzioni
+ * di utilita per non duplicare parsing e formattazione nei due programmi.
+ */
+#define PROTO_MAX_LINE 16384
+#define PROTO_MAX_TOKENS 32
+#define NICK_MAX 31
+#define PASS_MAX 31
+
+/* Direzioni logiche del gioco. Il protocollo le serializza come UP/DOWN/LEFT/RIGHT. */
+typedef enum {
+    DIR_UP = 0,
+    DIR_DOWN,
+    DIR_LEFT,
+    DIR_RIGHT
+} direction_t;
+
+/* Valida nickname/password secondo le regole comuni a client e server. */
+int proto_valid_name(const char *s, size_t max_len);
+
+/* Traduce una stringa, anche abbreviata come w/a/s/d, in direction_t. */
+int proto_parse_direction(const char *s, direction_t *dir);
+
+/* Restituisce il nome canonico usato nei messaggi di rete. */
+const char *proto_direction_name(direction_t dir);
+
+/* Spezza una riga in token in-place: il buffer passato viene modificato. */
+int proto_split(char *line, char **tokens, int max_tokens);
+
+/* Costruisce una riga completa di newline finale controllando la capienza. */
+int proto_make_line(char *dst, size_t dst_size, const char *fmt, ...);
+
+#endif
+
+
+=== FILE: src/common/utils.c ===
+#include "common/utils.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <stdlib.h>
+
+// Converte una stringa in long e valida che sia nel range richiesto.
+long utils_parse_long(const char *s, long min_value, long max_value, int *ok)
+{
+    char *end = NULL;
+    long value;
+
+    // ok parte sempre da falso: viene portato a vero solo alla fine della validazione.
+    if (ok != NULL)
+    {
+        *ok = 0;
+    }
+    if (s == NULL || *s == '\0')
+    {
+        return 0;
+    }
+    errno = 0;
+    value = strtol(s, &end, 10);
+    // Controlliamo: errore di conversione, nessuna cifra, caratteri residui e range.
+    if (errno != 0 || end == s || *end != '\0' || value < min_value || value > max_value)
+    {
+        return 0;
+    }
+    if (ok != NULL)
+    {
+        *ok = 1;
+    }
+    return value;
+}
+
+
+=== FILE: src/common/utils.h ===
+#ifndef UTILS_H
+#define UTILS_H
+
+/* Converte una stringa numerica in long e segnala con ok se e valida e nel range. */
+long utils_parse_long(const char *s, long min_value, long max_value, int *ok);
+
+#endif
+
+
+=== FILE: src/server/game.c ===
+#include "server/game.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define INITIAL_PLAYERS_CAPACITY 16
+#define MAP_COUNT 10
+
+/*
+ * Mappe statiche dei muri.
+ *
+ * Ogni layout e una griglia MAP_H x MAP_W: 1 significa muro, 0 significa
+ * cella attraversabile. game_init ne sceglie una a caso a inizio partita.
+ * Le proprieta delle celle non sono qui: vengono inizializzate separatamente
+ * in owner[y][x] e cambiano quando i giocatori si muovono.
+ */
+static const int WALL_MAPS[MAP_COUNT][MAP_H][MAP_W] = {
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    },
+    {
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    }
+};
+
+static void game_reveal_around(game_t *game, int player_id);
+
+// Verifica che una coordinata appartenga alla griglia di gioco.
+static int in_bounds(int x, int y) {
+    return x >= 0 && x < MAP_W && y >= 0 && y < MAP_H;
+}
+
+// Appende testo a un buffer senza superarne la dimensione.
+static int append_text(char *out, size_t out_size, const char *text) {
+    size_t used;
+    int written;
+
+    if (out_size == 0) {
+        return -1;
+    }
+    used = strlen(out);
+    // strlen e sicuro perche tutte le funzioni chiamanti inizializzano out[0] = '\0'.
+    if (used >= out_size) {
+        return -1;
+    }
+    written = snprintf(out + used, out_size - used, "%s", text);
+    if (written < 0 || (size_t)written >= out_size - used) {
+        return -1;
+    }
+    return 0;
+}
+
+// Genera l'identificatore stabile dello slot giocatore, ad esempio P0.
+static void symbol_for_slot(size_t slot, char *out, size_t out_size) {
+    snprintf(out, out_size, "P%zu", slot);
+}
+
+// Espande l'array dinamico dei giocatori quando non basta piu.
+static int game_reserve_players(game_t *game, size_t needed) {
+    player_t *new_players;
+    size_t old_capacity = game->player_capacity;
+    size_t new_capacity = old_capacity == 0 ? INITIAL_PLAYERS_CAPACITY : old_capacity;
+
+    while (new_capacity < needed) {
+        new_capacity *= 2;
+    }
+    if (new_capacity == old_capacity) {
+        return 0;
+    }
+    new_players = realloc(game->players, new_capacity * sizeof(*new_players));
+    if (new_players == NULL) {
+        return -1;
+    }
+    // Gli slot appena aggiunti partono a zero: used=0, active=0, coordinate nulle.
+    memset(new_players + old_capacity, 0, (new_capacity - old_capacity) * sizeof(*new_players));
+    game->players = new_players;
+    game->player_capacity = new_capacity;
+    return 0;
+}
+
+// Sceglie casualmente una cella libera e non occupata da giocatori attivi.
+static int find_free_spawn(const game_t *game, int *x, int *y) {
+    int yy;
+    int xx;
+    size_t p;
+    int occupied;
+    int free_count = 0;
+    int chosen;
+
+    // Primo passaggio: conta le celle spawnabili per poter scegliere uniformemente.
+    for (yy = 0; yy < MAP_H; ++yy) {
+        for (xx = 0; xx < MAP_W; ++xx) {
+            if (game->wall[yy][xx]) {
+                continue;
+            }
+            occupied = 0;
+            for (p = 0; p < game->player_count; ++p) {
+                if (game->players[p].active && game->players[p].x == xx && game->players[p].y == yy) {
+                    occupied = 1;
+                    break;
+                }
+            }
+            if (!occupied) {
+                free_count++;
+            }
+        }
+    }
+
+    if (free_count == 0) {
+        return -1;
+    }
+
+    chosen = rand() % free_count;
+    // Secondo passaggio: raggiunge la cella scelta senza dover allocare una lista.
+    for (yy = 0; yy < MAP_H; ++yy) {
+        for (xx = 0; xx < MAP_W; ++xx) {
+            if (game->wall[yy][xx]) {
+                continue;
+            }
+            occupied = 0;
+            for (p = 0; p < game->player_count; ++p) {
+                if (game->players[p].active && game->players[p].x == xx && game->players[p].y == yy) {
+                    occupied = 1;
+                    break;
+                }
+            }
+            if (!occupied) {
+                if (chosen == 0) {
+                    *x = xx;
+                    *y = yy;
+                    return 0;
+                }
+                chosen--;
+            }
+        }
+    }
+
+    return -1;
+}
+
+// Inizializza proprieta e muri scegliendo una delle mappe statiche disponibili.
+void game_init(game_t *game) {
+    int y;
+    int x;
+
+    srand((unsigned int)time(NULL));
+    // All'inizio nessuna cella ha proprietario.
+    for (y = 0; y < MAP_H; ++y) {
+        for (x = 0; x < MAP_W; ++x) {
+            game->owner[y][x] = -1;
+        }
+    }
+
+    // La struttura puo essere a zero perche server_init fa memset prima di game_init.
+    memcpy(game->wall, WALL_MAPS[rand() % MAP_COUNT], sizeof(game->wall));
+}
+
+// Libera le risorse dinamiche dello stato di gioco.
+void game_free(game_t *game) {
+    free(game->players);
+    memset(game, 0, sizeof(*game));
+}
+
+// Inserisce o riattiva un giocatore e gli assegna una posizione iniziale.
+int game_add_player(game_t *game, const char *nickname) {
+    size_t i;
+    size_t slot = 0;
+    int found_slot = 0;
+    int x = 0;
+    int y = 0;
+
+    if (game_find_player(game, nickname) >= 0 || find_free_spawn(game, &x, &y) != 0) {
+        return -1;
+    }
+    // Se lo stesso nickname aveva gia uno slot usato, lo riutilizziamo.
+    for (i = 0; i < game->player_count; ++i) {
+        if (game->players[i].used && strcmp(game->players[i].nickname, nickname) == 0) {
+            slot = i;
+            found_slot = 1;
+            break;
+        }
+    }
+    if (!found_slot) {
+        // Altrimenti cerchiamo uno slot liberato prima di espandere l'array.
+        for (i = 0; i < game->player_count; ++i) {
+            if (!game->players[i].used) {
+                slot = i;
+                found_slot = 1;
+                break;
+            }
+        }
+    }
+    if (!found_slot) {
+        // Nessuno slot libero: cresce l'array dinamico.
+        slot = game->player_count;
+        if (game_reserve_players(game, game->player_count + 1) != 0) {
+            return -1;
+        }
+        game->player_count++;
+    }
+
+    if (!game->players[slot].used) {
+        // Prima assegnazione dello slot: nickname e simbolo restano stabili.
+        memset(&game->players[slot], 0, sizeof(game->players[slot]));
+        strncpy(game->players[slot].nickname, nickname, NICK_MAX);
+        game->players[slot].nickname[NICK_MAX] = '\0';
+        symbol_for_slot(slot, game->players[slot].symbol, sizeof(game->players[slot].symbol));
+        game->players[slot].used = 1;
+    }
+    game->players[slot].active = 1;
+    game->players[slot].x = x;
+    game->players[slot].y = y;
+    // Entrare in gioco conquista subito la cella di spawn.
+    game->owner[y][x] = slot;
+    game_reveal_around(game, slot);
+    return (int)slot;
+}
+
+// Segna il giocatore come offline senza cancellare lo storico dei territori.
+void game_remove_player(game_t *game, int player_id) {
+    if (player_id >= 0 && (size_t)player_id < game->player_count) {
+        game->players[player_id].active = 0;
+    }
+}
+
+// Cerca un giocatore attualmente online dato il nickname.
+int game_find_player(const game_t *game, const char *nickname) {
+    size_t i;
+    for (i = 0; i < game->player_count; ++i) {
+        if (game->players[i].active && strcmp(game->players[i].nickname, nickname) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Aggiorna i muri scoperti nelle celle adiacenti al giocatore.
+static void game_reveal_around(game_t *game, int player_id) {
+    int dx;
+    int dy;
+    int x;
+    int y;
+    player_t *p;
+
+    if (player_id < 0 || (size_t)player_id >= game->player_count || !game->players[player_id].active) {
+        return;
+    }
+    p = &game->players[player_id];
+    // Raggio 1 intorno al giocatore: include la cella corrente e le 8 adiacenti.
+    for (dy = -1; dy <= 1; ++dy) {
+        for (dx = -1; dx <= 1; ++dx) {
+            x = p->x + dx;
+            y = p->y + dy;
+            if (in_bounds(x, y) && game->wall[y][x]) {
+                p->discovered_walls[y][x] = 1;
+            }
+        }
+    }
+}
+
+// Esegue un movimento se confini, muri e occupazione lo permettono.
+int game_move(game_t *game, int player_id, direction_t dir) {
+    int nx;
+    int ny;
+    size_t i;
+    player_t *p;
+
+    if (player_id < 0 || (size_t)player_id >= game->player_count || !game->players[player_id].active) {
+        return -1;
+    }
+    p = &game->players[player_id];
+    nx = p->x;
+    ny = p->y;
+    // Si calcola prima la destinazione; lo stato viene mutato solo dopo le validazioni.
+    if (dir == DIR_UP) {
+        --ny;
+    } else if (dir == DIR_DOWN) {
+        ++ny;
+    } else if (dir == DIR_LEFT) {
+        --nx;
+    } else if (dir == DIR_RIGHT) {
+        ++nx;
+    }
+
+    if (!in_bounds(nx, ny)) {
+        return -2;
+    }
+    if (game->wall[ny][nx]) {
+        // Il tentativo contro un muro lo rivela al giocatore, ma non cambia posizione.
+        p->discovered_walls[ny][nx] = 1;
+        game_reveal_around(game, player_id);
+        return -3;
+    }
+    for (i = 0; i < game->player_count; ++i) {
+        // Due giocatori attivi non possono occupare la stessa cella.
+        if ((int)i != player_id && game->players[i].active &&
+            game->players[i].x == nx && game->players[i].y == ny) {
+            return -4;
+        }
+    }
+    p->x = nx;
+    p->y = ny;
+    // Ogni movimento valido conquista o riconquista la cella di arrivo.
+    game->owner[ny][nx] = player_id;
+    game_reveal_around(game, player_id);
+    return 0;
+}
+
+// Aggiunge una cella alla codifica testuale della mappa separata da virgole.
+static int append_cell(char *out, size_t out_size, int *first_cell, const char *cell) {
+    if (!*first_cell) {
+        // La virgola separa le celle della stessa riga.
+        if (append_text(out, out_size, ",") != 0) {
+            return -1;
+        }
+    }
+    if (append_text(out, out_size, cell) != 0) {
+        return -1;
+    }
+    *first_cell = 0;
+    return 0;
+}
+
+// Costruisce la finestra 11x11 visibile dal singolo giocatore.
+int game_build_local_map(const game_t *game, int player_id, char *out, size_t out_size) {
+    int y;
+    int x;
+    int map_x;
+    int map_y;
+    int start_x;
+    int start_y;
+    int owner;
+    const player_t *p;
+
+    if (out_size == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+    if (player_id < 0 || (size_t)player_id >= game->player_count || !game->players[player_id].active) {
+        return -1;
+    }
+    p = &game->players[player_id];
+    // La finestra locale e centrata sul giocatore; fuori mappa si usa "~".
+    start_x = p->x - LOCAL_VIEW_W / 2;
+    start_y = p->y - LOCAL_VIEW_H / 2;
+
+    for (y = 0; y < LOCAL_VIEW_H; ++y) {
+        int first_cell = 1;
+        if (y > 0) {
+            // '/' separa le righe nella serializzazione compatta.
+            if (append_text(out, out_size, "/") != 0) {
+                return -1;
+            }
+        }
+        for (x = 0; x < LOCAL_VIEW_W; ++x) {
+            map_x = start_x + x;
+            map_y = start_y + y;
+            if (!in_bounds(map_x, map_y)) {
+                // "~" rappresenta spazio fuori dai confini della mappa globale.
+                if (append_cell(out, out_size, &first_cell, "~") != 0) {
+                    return -1;
+                }
+            } else if (p->x == map_x && p->y == map_y) {
+                // "@" identifica il giocatore corrente nella sua vista locale.
+                if (append_cell(out, out_size, &first_cell, "@") != 0) {
+                    return -1;
+                }
+            } else if (p->discovered_walls[map_y][map_x]) {
+                // I muri compaiono solo se questo giocatore li ha scoperti.
+                if (append_cell(out, out_size, &first_cell, "#") != 0) {
+                    return -1;
+                }
+            } else {
+                owner = game->owner[map_y][map_x];
+                if (append_cell(out, out_size, &first_cell,
+                                owner >= 0 && (size_t)owner < game->player_count && game->players[owner].used
+                                    ? game->players[owner].symbol
+                                    : ".") != 0) {
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Costruisce la mappa pubblica delle proprieta, senza rivelare i muri.
+int game_build_global_map(const game_t *game, char *out, size_t out_size) {
+    int y;
+    int x;
+    int owner;
+
+    if (out_size == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+    for (y = 0; y < MAP_H; ++y) {
+        int first_cell = 1;
+        if (y > 0) {
+            if (append_text(out, out_size, "/") != 0) {
+                return -1;
+            }
+        }
+        for (x = 0; x < MAP_W; ++x) {
+            owner = game->owner[y][x];
+            // La mappa globale mostra solo proprieta, non muri o posizioni correnti.
+            if (append_cell(out, out_size, &first_cell,
+                            owner >= 0 && (size_t)owner < game->player_count && game->players[owner].used
+                                ? game->players[owner].symbol
+                                : ".") != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Codifica nickname, identificatore e coordinate dei giocatori online.
+int game_build_positions(const game_t *game, char *out, size_t out_size) {
+    size_t i;
+    char tmp[128];
+
+    if (out_size == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+    for (i = 0; i < game->player_count; ++i) {
+        if (game->players[i].active) {
+            // Formato elemento: nickname:simbolo:x:y, separato dagli altri con virgole.
+            if (out[0] != '\0') {
+                if (append_text(out, out_size, ",") != 0) {
+                    return -1;
+                }
+            }
+            snprintf(tmp, sizeof(tmp), "%s:%s:%d:%d",
+                     game->players[i].nickname,
+                     game->players[i].symbol,
+                     game->players[i].x,
+                     game->players[i].y);
+            if (append_text(out, out_size, tmp) != 0) {
+                return -1;
+            }
+        }
+    }
+    if (out[0] == '\0') {
+        if (append_text(out, out_size, "-") != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Calcola e codifica il punteggio di tutti gli slot giocatore usati.
+int game_build_scores(const game_t *game, char *out, size_t out_size) {
+    int *scores;
+    int y;
+    int x;
+    size_t i;
+    char tmp[96];
+
+    if (out_size == 0) {
+        return -1;
+    }
+    scores = calloc(game->player_count == 0 ? 1 : game->player_count, sizeof(*scores));
+    if (scores == NULL) {
+        snprintf(out, out_size, "-");
+        return -1;
+    }
+    out[0] = '\0';
+    // Prima si accumula il numero di celle possedute per ogni slot.
+    for (y = 0; y < MAP_H; ++y) {
+        for (x = 0; x < MAP_W; ++x) {
+            if (game->owner[y][x] >= 0 &&
+                (size_t)game->owner[y][x] < game->player_count &&
+                game->players[game->owner[y][x]].used) {
+                scores[game->owner[y][x]]++;
+            }
+        }
+    }
+    // Poi si serializzano solo gli slot effettivamente usati nella partita.
+    for (i = 0; i < game->player_count; ++i) {
+        if (game->players[i].used) {
+            if (out[0] != '\0') {
+                if (append_text(out, out_size, ",") != 0) {
+                    free(scores);
+                    return -1;
+                }
+            }
+            snprintf(tmp, sizeof(tmp), "%s:%d", game->players[i].nickname, scores[i]);
+            if (append_text(out, out_size, tmp) != 0) {
+                free(scores);
+                return -1;
+            }
+        }
+    }
+    if (out[0] == '\0') {
+        if (append_text(out, out_size, "-") != 0) {
+            free(scores);
+            return -1;
+        }
+    }
+    free(scores);
+    return 0;
+}
+
+// Trova il giocatore con piu celle possedute e restituisce nickname/punteggio.
+int game_winner(const game_t *game, char *nickname, size_t nickname_size, int *score) {
+    int *scores;
+    int best = -1;
+    int best_score = -1;
+    int y;
+    int x;
+    size_t i;
+
+    scores = calloc(game->player_count == 0 ? 1 : game->player_count, sizeof(*scores));
+    if (scores == NULL) {
+        snprintf(nickname, nickname_size, "-");
+        *score = 0;
+        return -1;
+    }
+    // Stesso criterio dei punteggi: conta quante celle puntano a ciascun owner.
+    for (y = 0; y < MAP_H; ++y) {
+        for (x = 0; x < MAP_W; ++x) {
+            if (game->owner[y][x] >= 0 &&
+                (size_t)game->owner[y][x] < game->player_count &&
+                game->players[game->owner[y][x]].used) {
+                scores[game->owner[y][x]]++;
+            }
+        }
+    }
+    // In caso di parita vince il primo slot che ha raggiunto quel punteggio.
+    for (i = 0; i < game->player_count; ++i) {
+        if (game->players[i].used && scores[i] > best_score) {
+            best = (int)i;
+            best_score = scores[i];
+        }
+    }
+    if (best < 0) {
+        snprintf(nickname, nickname_size, "-");
+        *score = 0;
+        free(scores);
+        return -1;
+    }
+    snprintf(nickname, nickname_size, "%s", game->players[best].nickname);
+    *score = best_score;
+    free(scores);
+    return 0;
+}
+
+
+=== FILE: src/server/game.h ===
+#ifndef GAME_H
+#define GAME_H
+
+#include "common/protocol.h"
+
+#define MAP_W 30
+#define MAP_H 15
+#define LOCAL_VIEW_W 11
+#define LOCAL_VIEW_H 11
+#define PLAYER_SYMBOL_MAX 32
+
+/*
+ * Modello della partita.
+ *
+ * La griglia e autoritativa solo sul server. Ogni cella puo essere:
+ * - muro in wall[y][x], non conquistabile;
+ * - libera o posseduta da uno slot giocatore in owner[y][x];
+ * - occupata temporaneamente da un giocatore attivo tramite player_t.x/y.
+ */
+
+// Stato persistente di un giocatore. Lo slot resta associato al nickname
+// anche dopo la disconnessione, cosi la proprieta delle celle rimane stabile.
+typedef struct {
+    char nickname[NICK_MAX + 1];
+    /* active indica presenza online; used indica che lo slot e stato assegnato almeno una volta. */
+    int active;
+    int used;
+    char symbol[PLAYER_SYMBOL_MAX];
+    /* Coordinate correnti sulla griglia globale. */
+    int x;
+    int y;
+    /* Muri scoperti dal singolo giocatore: la conoscenza e individuale. */
+    unsigned char discovered_walls[MAP_H][MAP_W];
+} player_t;
+
+typedef struct {
+    /* wall vale 1 per muro fisico, 0 per cella attraversabile. */
+    int wall[MAP_H][MAP_W];
+    /* owner contiene l'indice player_t proprietario, oppure -1 se non conquistata. */
+    int owner[MAP_H][MAP_W];
+    /* Array dinamico di slot giocatore. */
+    player_t *players;
+    size_t player_count;
+    size_t player_capacity;
+} game_t;
+
+/* Lifecycle dello stato di gioco. */
+void game_init(game_t *game);
+void game_free(game_t *game);
+
+/* Gestione presenza giocatori. */
+int game_add_player(game_t *game, const char *nickname);
+void game_remove_player(game_t *game, int player_id);
+int game_find_player(const game_t *game, const char *nickname);
+
+/* Applica un movimento: 0 ok, valori negativi distinguono i casi di errore. */
+int game_move(game_t *game, int player_id, direction_t dir);
+
+/* Serializzazioni usate dal protocollo server->client. */
+int game_build_local_map(const game_t *game, int player_id, char *out, size_t out_size);
+int game_build_global_map(const game_t *game, char *out, size_t out_size);
+int game_build_positions(const game_t *game, char *out, size_t out_size);
+int game_build_scores(const game_t *game, char *out, size_t out_size);
+
+/* Calcolo finale del vincitore in base al numero di celle conquistate. */
+int game_winner(const game_t *game, char *nickname, size_t nickname_size, int *score);
+
+#endif
+
+
+=== FILE: src/server/main.c ===
+#include "common/utils.h"
+#include "common/net.h"
+#include "server/server.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+// Punto di ingresso del server: valida gli argomenti e avvia server_run().
+int main(int argc, char **argv) {
+    int ok;
+    // Valori default richiesti dal progetto: partita di 5 minuti, update ogni 5 secondi.
+    long duration = 300;
+    long period = 5;
+
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "uso non valido: %s <porta> [durata_secondi (default 300)] [periodo_secondi (default 5)]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (argc >= 3) {
+        // Durata minima 10 secondi per evitare partite terminate subito.
+        duration = utils_parse_long(argv[2], 10, 86400, &ok);
+        if (!ok) {
+            fprintf(stderr, "durata non valida: %s\n", argv[2]);
+            return EXIT_FAILURE;
+        }
+    }
+    if (argc == 4) {
+        // Il periodo determina ogni quanto viene mandato S2C_GLOBAL_UPDATE.
+        period = utils_parse_long(argv[3], 1, 3600, &ok);
+        if (!ok) {
+            fprintf(stderr, "periodo non valido: %s\n", argv[3]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    // La porta viene validata dentro net_create_server_socket, chiamata da server_run.
+    if (server_run(argv[1], (int)duration, (int)period) != 0) {
+        fprintf(stderr, "terminazione server con errore: %s\n", net_last_error());
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+
+=== FILE: src/server/server.c ===
+#include "server/server.h"
+
+#include "common/net.h"
+#include "common/protocol.h"
+#include "common/utils.h"
+
+#include <errno.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <time.h>
+#include <unistd.h>
+
+#define INITIAL_CLIENTS_CAPACITY 16
+
+/*
+ * Core del server.
+ *
+ * Il server non crea thread: usa select(2) per osservare contemporaneamente
+ * socket di ascolto, socket dei client e timeout periodici. Questo rende piu
+ * esplicito il flusso didattico: ogni evento viene gestito nel ciclo principale.
+ */
+
+// Riporta una sessione client allo stato libero.
+static void client_reset(client_session_t *c)
+{
+    c->fd = -1;
+    c->authenticated = 0;
+    c->player_id = -1;
+    c->inbuf_len = 0;
+}
+
+// Inizializza lo stato globale del server e la partita.
+static void server_init(server_t *s, int listen_fd, int duration_sec, int period_sec)
+{
+    // Azzera anche puntatori e contatori: importante per cleanup sicuro.
+    memset(s, 0, sizeof(*s));
+    s->listen_fd = listen_fd;
+    s->duration_sec = duration_sec;
+    s->period_sec = period_sec;
+    s->running = 1;
+    s->start_time = time(NULL);
+    s->next_update = s->start_time + period_sec;
+    game_init(&s->game);
+}
+
+// Libera array dinamici e sottostrutture possedute dal server.
+static void server_free(server_t *s)
+{
+    // listen_fd viene chiuso in server_run; qui si liberano solo risorse heap/applicative.
+    free(s->clients);
+    users_free(&s->users);
+    game_free(&s->game);
+    s->clients = NULL;
+    s->client_count = 0;
+    s->client_capacity = 0;
+}
+
+// Garantisce spazio per almeno needed sessioni client.
+static int server_reserve_clients(server_t *s, size_t needed)
+{
+    // Le sessioni crescono dinamicamente; il limite pratico resta quello di select/OS.
+    client_session_t *new_clients;
+    size_t i;
+    size_t old_capacity = s->client_capacity;
+    size_t new_capacity = old_capacity == 0 ? INITIAL_CLIENTS_CAPACITY : old_capacity;
+
+    while (new_capacity < needed)
+    {
+        // Crescita per raddoppio: costo ammortizzato basso.
+        new_capacity *= 2;
+    }
+    if (new_capacity == old_capacity)
+    {
+        return 0;
+    }
+    new_clients = realloc(s->clients, new_capacity * sizeof(*new_clients));
+    if (new_clients == NULL)
+    {
+        return -1;
+    }
+    s->clients = new_clients;
+    for (i = old_capacity; i < new_capacity; ++i)
+    {
+        // Gli slot nuovi devono partire marcati come liberi (fd = -1).
+        client_reset(&s->clients[i]);
+    }
+    s->client_capacity = new_capacity;
+    return 0;
+}
+
+static void disconnect_client(server_t *s, int index);
+
+// Costruisce una risposta S2C e la invia come singola riga di protocollo.
+static int sendf(client_session_t *c, const char *fmt, ...)
+{
+    char payload[PROTO_MAX_LINE];
+    char line[PROTO_MAX_LINE];
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(payload, sizeof(payload), fmt, ap);
+    va_end(ap);
+    // Rifiutiamo messaggi troppo lunghi invece di inviare righe troncate.
+    if (n < 0 || (size_t)n >= sizeof(payload))
+    {
+        return -1;
+    }
+    if (proto_make_line(line, sizeof(line), "%s", payload) < 0)
+    {
+        return -1;
+    }
+    if (net_send_line(c->fd, line) != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+// Invia al client la mappa locale del suo giocatore.
+static int send_local(server_t *s, client_session_t *c)
+{
+    char map[PROTO_MAX_LINE];
+    if (c->authenticated && c->player_id >= 0)
+    {
+        // La vista locale dipende dal giocatore: include muri scoperti solo da lui.
+        if (game_build_local_map(&s->game, c->player_id, map, sizeof(map)) != 0)
+        {
+            return sendf(c, "S2C_ERR ENCODING_FAILED");
+        }
+        return sendf(c, "S2C_LOCAL_MAP %d %d %s", LOCAL_VIEW_W, LOCAL_VIEW_H, map);
+    }
+    return 0;
+}
+
+// Invia a un client la vista globale pubblica dello stato di gioco.
+static int send_global_to_client(server_t *s, client_session_t *c)
+{
+    char map[PROTO_MAX_LINE];
+    char pos[PROTO_MAX_LINE];
+    if (c->fd >= 0 && c->authenticated)
+    {
+        // La vista globale e pubblica: proprieta celle + posizioni giocatori online.
+        if (game_build_global_map(&s->game, map, sizeof(map)) != 0 ||
+            game_build_positions(&s->game, pos, sizeof(pos)) != 0)
+        {
+            return sendf(c, "S2C_ERR ENCODING_FAILED");
+        }
+        return sendf(c, "S2C_GLOBAL_UPDATE %d %d %s %s", MAP_W, MAP_H, map, pos);
+    }
+    return 0;
+}
+
+// Invia l'aggiornamento globale a tutti i client autenticati.
+static void broadcast_global(server_t *s)
+{
+    size_t i;
+
+    for (i = 0; i < s->client_count; ++i)
+    {
+        // Se l'invio fallisce, la connessione viene chiusa e lo slot torna libero.
+        if (send_global_to_client(s, &s->clients[i]) != 0)
+        {
+            disconnect_client(s, i);
+        }
+    }
+}
+
+// Chiude una connessione e aggiorna lo stato del giocatore associato.
+static void disconnect_client(server_t *s, int index)
+{
+    client_session_t *c = &s->clients[index];
+    if (c->fd >= 0)
+    {
+        close(c->fd);
+    }
+    if (c->authenticated && c->player_id >= 0)
+    {
+        // Il giocatore diventa offline, ma i territori restano assegnati al suo slot.
+        game_remove_player(&s->game, c->player_id);
+    }
+    client_reset(c);
+}
+
+// Accetta una nuova connessione e la inserisce in uno slot disponibile.
+static void accept_client(server_t *s)
+{
+    int fd;
+    size_t i;
+    size_t slot;
+
+    fd = accept(s->listen_fd, NULL, NULL);
+    if (fd < 0)
+    {
+        return;
+    }
+    // select(2) usa fd_set: descrittori oltre FD_SETSIZE non sono gestibili.
+    if (fd >= FD_SETSIZE)
+    {
+        net_send_line(fd, "S2C_ERR SERVER_FULL\n");
+        close(fd);
+        return;
+    }
+    for (i = 0; i < s->client_count; ++i)
+    {
+        // Riusa slot di client disconnessi prima di allargare l'array.
+        if (s->clients[i].fd < 0)
+        {
+            client_reset(&s->clients[i]);
+            s->clients[i].fd = fd;
+            sendf(&s->clients[i], "S2C_OK CONNECTED");
+            return;
+        }
+    }
+    slot = s->client_count;
+    // Nessuno slot libero: si prova ad aggiungerne uno nuovo.
+    if (server_reserve_clients(s, s->client_count + 1) != 0)
+    {
+        net_send_line(fd, "S2C_ERR SERVER_FULL\n");
+        close(fd);
+        return;
+    }
+    s->client_count++;
+    client_reset(&s->clients[slot]);
+    s->clients[slot].fd = fd;
+    sendf(&s->clients[slot], "S2C_OK CONNECTED");
+}
+
+// Controlla che il comando richiedente appartenga a un client autenticato.
+static int require_auth(client_session_t *c)
+{
+    if (!c->authenticated)
+    {
+        sendf(c, "S2C_ERR NOT_AUTHENTICATED");
+        return 0;
+    }
+    return 1;
+}
+
+// Gestisce C2S_REGISTER.
+static void handle_register(server_t *s, client_session_t *c, char **tok, int ntok)
+{
+    int rc;
+    // Sintassi richiesta: C2S_REGISTER <nickname> <password>.
+    if (ntok != 3)
+    {
+        sendf(c, "S2C_ERR BAD_SYNTAX");
+        return;
+    }
+    rc = users_register(&s->users, tok[1], tok[2]);
+    if (rc == 0)
+    {
+        sendf(c, "S2C_OK REGISTERED");
+    }
+    else if (rc == -1)
+    {
+        sendf(c, "S2C_ERR USER_EXISTS");
+    }
+    else if (rc == -2)
+    {
+        sendf(c, "S2C_ERR INVALID_CREDENTIALS");
+    }
+    else
+    {
+        sendf(c, "S2C_ERR USER_DB_FULL");
+    }
+}
+
+// Gestisce C2S_LOGIN e crea la presenza del giocatore nella partita.
+static void handle_login(server_t *s, client_session_t *c, char **tok, int ntok)
+{
+    int player_id;
+    // Sintassi richiesta: C2S_LOGIN <nickname> <password>.
+    if (ntok != 3)
+    {
+        sendf(c, "S2C_ERR BAD_SYNTAX");
+        return;
+    }
+    if (c->authenticated)
+    {
+        sendf(c, "S2C_ERR ALREADY_AUTHENTICATED");
+        return;
+    }
+    if (users_authenticate(&s->users, tok[1], tok[2]) != 0)
+    {
+        sendf(c, "S2C_ERR AUTH_FAILED");
+        return;
+    }
+    if (game_find_player(&s->game, tok[1]) >= 0)
+    {
+        // Impedisce lo stesso nickname online da due connessioni contemporanee.
+        sendf(c, "S2C_ERR USER_ALREADY_ONLINE");
+        return;
+    }
+    player_id = game_add_player(&s->game, tok[1]);
+    if (player_id < 0)
+    {
+        sendf(c, "S2C_ERR GAME_FULL");
+        return;
+    }
+    c->authenticated = 1;
+    c->player_id = player_id;
+    // Il login restituisce anche simbolo e coordinate iniziali, cosi la UI si aggiorna subito.
+    sendf(c, "S2C_OK LOGGED_IN %s %s %d %d",
+          tok[1],
+          s->game.players[player_id].symbol,
+          s->game.players[player_id].x,
+          s->game.players[player_id].y);
+    send_local(s, c);
+    // Dopo un nuovo login tutti devono vedere la nuova presenza globale.
+    broadcast_global(s);
+}
+
+// Gestisce C2S_MOVE e comunica l'esito del movimento.
+static void handle_move(server_t *s, client_session_t *c, char **tok, int ntok)
+{
+    direction_t dir;
+    int rc;
+    if (!require_auth(c))
+    {
+        return;
+    }
+    if (ntok != 2 || proto_parse_direction(tok[1], &dir) != 0)
+    {
+        sendf(c, "S2C_ERR BAD_DIRECTION");
+        return;
+    }
+    rc = game_move(&s->game, c->player_id, dir);
+    if (rc == 0)
+    {
+        sendf(c, "S2C_OK MOVED %d %d", s->game.players[c->player_id].x, s->game.players[c->player_id].y);
+    }
+    else if (rc == -2)
+    {
+        sendf(c, "S2C_ERR OUT_OF_BOUNDS");
+    }
+    else if (rc == -3)
+    {
+        sendf(c, "S2C_ERR WALL");
+    }
+    else if (rc == -4)
+    {
+        sendf(c, "S2C_ERR OCCUPIED");
+    }
+    else
+    {
+        sendf(c, "S2C_ERR MOVE_FAILED");
+    }
+    // Anche dopo errore WALL la mappa locale puo cambiare perche il muro viene scoperto.
+    send_local(s, c);
+}
+
+// Gestisce C2S_LIST_USERS.
+static void handle_users(server_t *s, client_session_t *c)
+{
+    char pos[PROTO_MAX_LINE];
+    if (!require_auth(c))
+    {
+        return;
+    }
+    if (game_build_positions(&s->game, pos, sizeof(pos)) != 0)
+    {
+        sendf(c, "S2C_ERR ENCODING_FAILED");
+        return;
+    }
+    sendf(c, "S2C_USERS %s", pos);
+}
+
+// Smista una riga C2S verso il gestore del comando corrispondente.
+static void handle_line(server_t *s, int index, char *line)
+{
+    client_session_t *c = &s->clients[index];
+    char *tok[PROTO_MAX_TOKENS];
+    int ntok = proto_split(line, tok, PROTO_MAX_TOKENS);
+
+    // Dispatch esplicito: ogni comando C2S viene validato nel proprio handler.
+    if (ntok == 0)
+    {
+        return;
+    }
+    if (strcmp(tok[0], "C2S_REGISTER") == 0)
+    {
+        handle_register(s, c, tok, ntok);
+    }
+    else if (strcmp(tok[0], "C2S_LOGIN") == 0)
+    {
+        handle_login(s, c, tok, ntok);
+    }
+    else if (strcmp(tok[0], "C2S_MOVE") == 0)
+    {
+        handle_move(s, c, tok, ntok);
+    }
+    else if (strcmp(tok[0], "C2S_LIST_USERS") == 0 && ntok == 1)
+    {
+        handle_users(s, c);
+    }
+    else if (strcmp(tok[0], "C2S_LOCAL_MAP") == 0 && ntok == 1)
+    {
+        if (require_auth(c))
+        {
+            send_local(s, c);
+        }
+    }
+    else if (strcmp(tok[0], "C2S_GLOBAL_MAP") == 0 && ntok == 1)
+    {
+        if (require_auth(c))
+        {
+            if (send_global_to_client(s, c) != 0)
+            {
+                disconnect_client(s, index);
+            }
+        }
+    }
+    else if (strcmp(tok[0], "C2S_QUIT") == 0 && ntok == 1)
+    {
+        // Conferma applicativa prima della chiusura della socket.
+        sendf(c, "S2C_OK BYE");
+        disconnect_client(s, index);
+    }
+    else if (strncmp(tok[0], "C2S_", 4) == 0)
+    {
+        sendf(c, "S2C_ERR BAD_SYNTAX");
+    }
+    else
+    {
+        sendf(c, "S2C_ERR UNKNOWN_COMMAND");
+    }
+}
+
+// Legge dal socket client e processa tutte le righe complete ricevute.
+static int read_client(server_t *s, int index)
+{
+    client_session_t *c = &s->clients[index];
+    char tmp[512];
+    ssize_t n;
+
+    n = recv(c->fd, tmp, sizeof(tmp), 0);
+    if (n < 0 && errno == EINTR)
+    {
+        return 0;
+    }
+    if (n <= 0)
+    {
+        disconnect_client(s, index);
+        return -1;
+    }
+    if (c->inbuf_len + (size_t)n >= sizeof(c->inbuf))
+    {
+        sendf(c, "S2C_ERR LINE_TOO_LONG");
+        disconnect_client(s, index);
+        return -1;
+    }
+    memcpy(c->inbuf + c->inbuf_len, tmp, (size_t)n);
+    c->inbuf_len += (size_t)n;
+    c->inbuf[c->inbuf_len] = '\0';
+
+    while (1)
+    {
+        // TCP non conserva i confini dei messaggi: si processano solo righe complete.
+        char *nl = memchr(c->inbuf, '\n', c->inbuf_len);
+        size_t line_len;
+        char line[PROTO_MAX_LINE];
+        if (nl == NULL)
+        {
+            break;
+        }
+        line_len = (size_t)(nl - c->inbuf);
+        if (line_len >= sizeof(line))
+        {
+            disconnect_client(s, index);
+            return -1;
+        }
+        memcpy(line, c->inbuf, line_len);
+        line[line_len] = '\0';
+        memmove(c->inbuf, nl + 1, c->inbuf_len - line_len - 1);
+        c->inbuf_len -= line_len + 1;
+        c->inbuf[c->inbuf_len] = '\0';
+        handle_line(s, index, line);
+        if (c->fd < 0)
+        {
+            // Il comando poteva essere QUIT o causare disconnessione.
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Invia a tutti i client il risultato finale della partita.
+static void broadcast_game_over(server_t *s)
+{
+    size_t i;
+    char winner[NICK_MAX + 1];
+    char scores[PROTO_MAX_LINE];
+    int score;
+
+    game_winner(&s->game, winner, sizeof(winner), &score);
+    if (game_build_scores(&s->game, scores, sizeof(scores)) != 0)
+    {
+        snprintf(scores, sizeof(scores), "-");
+    }
+    for (i = 0; i < s->client_count; ++i)
+    {
+        // Si informa anche un client non autenticato ma connesso, se presente.
+        if (s->clients[i].fd >= 0)
+        {
+            sendf(&s->clients[i], "S2C_GAME_OVER %s %d %s", winner, score, scores);
+        }
+    }
+}
+
+// Calcola il timeout da passare a select per il prossimo evento temporizzato.
+static long seconds_until_next_event(server_t *s)
+{
+    time_t now = time(NULL);
+    time_t end = s->start_time + s->duration_sec;
+    // Il prossimo risveglio deve servire il prima possibile fra update globale e fine partita.
+    time_t next = s->next_update < end ? s->next_update : end;
+    if (next <= now)
+    {
+        return 0;
+    }
+    return (long)(next - now);
+}
+
+// Avvia il server: socket di ascolto, ciclo select, timer e cleanup finale.
+int server_run(const char *port, int duration_sec, int period_sec)
+{
+    server_t s;
+    int listen_fd = net_create_server_socket(port);
+
+    if (listen_fd < 0)
+    {
+        return -1;
+    }
+    if (listen_fd >= FD_SETSIZE)
+    {
+        // select non puo monitorare descrittori >= FD_SETSIZE.
+        close(listen_fd);
+        return -1;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    server_init(&s, listen_fd, duration_sec, period_sec);
+
+    while (s.running)
+    {
+        fd_set rfds;
+        struct timeval tv;
+        int maxfd = s.listen_fd;
+        int rc;
+        size_t i;
+        time_t now;
+
+        FD_ZERO(&rfds);
+        FD_SET(s.listen_fd, &rfds);
+        for (i = 0; i < s.client_count; ++i)
+        {
+            // Solo gli slot con fd valido partecipano alla select.
+            if (s.clients[i].fd >= 0)
+            {
+                FD_SET(s.clients[i].fd, &rfds);
+                if (s.clients[i].fd > maxfd)
+                {
+                    maxfd = s.clients[i].fd;
+                }
+            }
+        }
+
+        tv.tv_sec = seconds_until_next_event(&s);
+        tv.tv_usec = 0;
+        // select multiplexa socket di ascolto, socket client e timer periodici.
+        rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (rc < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+        if (rc > 0 && FD_ISSET(s.listen_fd, &rfds))
+        {
+            accept_client(&s);
+        }
+        for (i = 0; i < s.client_count; ++i)
+        {
+            if (s.clients[i].fd >= 0 && FD_ISSET(s.clients[i].fd, &rfds))
+            {
+                read_client(&s, i);
+            }
+        }
+
+        now = time(NULL);
+        if (now >= s.next_update)
+        {
+            // Aggiornamento periodico globale indipendente dai comandi dei client.
+            broadcast_global(&s);
+            s.next_update = now + s.period_sec;
+        }
+        if (now >= s.start_time + s.duration_sec)
+        {
+            // Chiusura autoritativa della partita allo scadere del timer.
+            broadcast_game_over(&s);
+            s.running = 0;
+        }
+    }
+
+    for (size_t i = 0; i < s.client_count; ++i)
+    {
+        // Cleanup finale: chiude ogni fd rimasto aperto e marca offline i giocatori.
+        disconnect_client(&s, i);
+    }
+    close(s.listen_fd);
+    server_free(&s);
+    return 0;
+}
+
+
+=== FILE: src/server/server.h ===
+#ifndef SERVER_H
+#define SERVER_H
+
+#include "server/game.h"
+#include "server/users.h"
+
+#include <time.h>
+
+/*
+ * Stato di una connessione client.
+ *
+ * Una sessione puo esistere anche se non autenticata: in quel caso puo solo
+ * registrarsi, fare login o chiudere. Dopo il login player_id collega la
+ * sessione allo slot nello stato di gioco.
+ */
+typedef struct {
+    int fd; 
+    int authenticated; 
+    int player_id;
+    /* Buffer di accumulo per TCP stream: puo contenere mezza riga o piu righe. */
+    char inbuf[PROTO_MAX_LINE];
+    size_t inbuf_len;
+} client_session_t;
+
+/*
+ * Stato globale del server.
+ *
+ * Il server e single-process e usa select(2), quindi mantiene tutte le sessioni
+ * in un array e calcola manualmente timer di aggiornamento e fine partita.
+ */
+typedef struct {
+    int listen_fd;
+    int duration_sec;
+    int period_sec;
+    int running; 
+    /* Timer assoluti basati su time(NULL). */
+    time_t start_time;
+    time_t next_update;
+    /* Sottosistemi applicativi posseduti dal server. */
+    user_db_t users;
+    game_t game;
+    /* Array dinamico di sessioni client. */
+    client_session_t *clients;
+    size_t client_count;
+    size_t client_capacity;
+} server_t;
+
+/* Avvia il ciclo del server sulla porta indicata. */
+int server_run(const char *port, int duration_sec, int period_sec);
+
+#endif
+
+
+=== FILE: src/server/users.c ===
+#include "server/users.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#define INITIAL_USERS_CAPACITY 16
+
+// Libera il database utenti mantenuto in memoria.
+void users_free(user_db_t *db) {
+    free(db->items);
+    memset(db, 0, sizeof(*db));
+}
+
+// Garantisce spazio per almeno needed utenti nell'array dinamico.
+static int users_reserve(user_db_t *db, size_t needed) {
+    user_t *new_items;
+    size_t new_capacity = db->capacity == 0 ? INITIAL_USERS_CAPACITY : db->capacity;
+
+    // Crescita geometrica: poche realloc anche con molti utenti.
+    while (new_capacity < needed) {
+        new_capacity *= 2;
+    }
+    if (new_capacity == db->capacity) {
+        return 0;
+    }
+    new_items = realloc(db->items, new_capacity * sizeof(*new_items));
+    if (new_items == NULL) {
+        return -1;
+    }
+    db->items = new_items;
+    db->capacity = new_capacity;
+    return 0;
+}
+
+// Controlla se un nickname e gia registrato.
+static int users_exists(const user_db_t *db, const char *nickname) {
+    size_t i;
+    for (i = 0; i < db->count; ++i) {
+        if (strcmp(db->items[i].nickname, nickname) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Registra un nuovo utente dopo validazione di nickname e password.
+int users_register(user_db_t *db, const char *nickname, const char *password) {
+    // La validazione e comune al protocollo: niente spazi, cosi il parsing a token resta sicuro.
+    if (!proto_valid_name(nickname, NICK_MAX) || !proto_valid_name(password, PASS_MAX)) {
+        return -2;
+    }
+    if (users_exists(db, nickname)) {
+        return -1;
+    }
+    if (users_reserve(db, db->count + 1) != 0) {
+        return -3;
+    }
+    // strncpy viene completata con terminatore esplicito per garantire stringhe C valide.
+    strncpy(db->items[db->count].nickname, nickname, NICK_MAX);
+    strncpy(db->items[db->count].password, password, PASS_MAX);
+    db->items[db->count].nickname[NICK_MAX] = '\0';
+    db->items[db->count].password[PASS_MAX] = '\0';
+    db->count++;
+    return 0;
+}
+
+// Verifica che nickname e password corrispondano a un utente registrato.
+int users_authenticate(const user_db_t *db, const char *nickname, const char *password) {
+    size_t i;
+    for (i = 0; i < db->count; ++i) {
+        if (strcmp(db->items[i].nickname, nickname) == 0 &&
+            strcmp(db->items[i].password, password) == 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+
+=== FILE: src/server/users.h ===
+#ifndef USERS_H
+#define USERS_H
+
+#include "common/protocol.h"
+
+/* Credenziali in memoria. Per un progetto reale la password non andrebbe salvata in chiaro. */
+typedef struct {
+    char nickname[NICK_MAX + 1];
+    char password[PASS_MAX + 1];
+} user_t;
+
+/* Database dinamico minimale: array, numero di elementi usati e capacita allocata. */
+typedef struct {
+    user_t *items;
+    size_t count;
+    size_t capacity;
+} user_db_t;
+
+/* Libera l'array degli utenti e azzera la struttura. */
+void users_free(user_db_t *db);
+
+/* Registra un utente: 0 ok, -1 esiste, -2 credenziali non valide, -3 memoria. */
+int users_register(user_db_t *db, const char *nickname, const char *password);
+
+/* Verifica nickname/password: 0 se corrispondono, -1 altrimenti. */
+int users_authenticate(const user_db_t *db, const char *nickname, const char *password);
+
+#endif
+
+
